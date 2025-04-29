@@ -32,6 +32,10 @@ ruler:
 
 # Add limits_config to increase ingestion limits for local development
 limits_config:
+  # Stop rejecting samples based on age for local dev
+  reject_old_samples: false
+  # reject_old_samples_max_age: 168h # Default is 1 week (168h)
+
   # Set limits to very high values for local development
 
   # User-level limits (MB/s)

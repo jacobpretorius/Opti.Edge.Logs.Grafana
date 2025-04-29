@@ -1,4 +1,4 @@
-import { BlobServiceClient, ContainerClient } from '@azure/storage-blob';
+import { ContainerClient } from '@azure/storage-blob';
 import dotenv from 'dotenv';
 import fetch from 'node-fetch';
 import { createGunzip } from 'zlib';
