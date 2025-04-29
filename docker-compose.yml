@@ -11,6 +11,12 @@ services:
       - ./loki-config.yml:/etc/loki/local-config.yaml
     networks:
       - loki-net
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:3100/ready"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
 
   grafana:
     image: grafana/grafana:latest
@@ -32,7 +38,8 @@ services:
     build: ./log-ingestor
     container_name: log-ingestor
     depends_on:
-      - loki
+      loki:
+        condition: service_healthy
     volumes:
       - ./log-ingestor:/usr/src/app
       - /usr/src/app/node_modules # Prevent host node_modules from overwriting container

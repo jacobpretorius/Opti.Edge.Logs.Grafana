@@ -14,8 +14,8 @@ RUN mkdir -p /usr/src/app/logs_temp
 
 # Define LOKI_URL and EDGE_LOGS_BLOB_URL in .env file or as environment variables
 ENV LOKI_URL=http://loki:3100
-# Default to 60 seconds
-ENV POLLING_INTERVAL_MS=60000
+# Default to 5 seconds
+ENV POLLING_INTERVAL_MS=5000
 # Default temp directory inside container
 ENV TEMP_LOG_DIR=/usr/src/app/logs_temp
 
