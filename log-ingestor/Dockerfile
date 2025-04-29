@@ -1,0 +1,22 @@
+FROM node:18-alpine
+
+WORKDIR /usr/src/app
+
+COPY package*.json ./
+
+RUN npm install
+
+COPY . .
+
+# Create the temporary logs directory within the container
+# Ensure this path matches TEMP_LOG_DIR env var and volume mount
+RUN mkdir -p /usr/src/app/logs_temp
+
+# Define LOKI_URL and EDGE_LOGS_BLOB_URL in .env file or as environment variables
+ENV LOKI_URL=http://loki:3100
+# Default to 60 seconds
+ENV POLLING_INTERVAL_MS=60000
+# Default temp directory inside container
+ENV TEMP_LOG_DIR=/usr/src/app/logs_temp
+
+CMD [ "npm", "start" ] 

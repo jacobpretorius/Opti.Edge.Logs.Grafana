@@ -1,0 +1,39 @@
+auth_enabled: false
+
+server:
+  http_listen_port: 3100
+
+common:
+  instance_addr: 127.0.0.1
+  path_prefix: /tmp/loki
+  storage:
+    filesystem:
+      chunks_directory: /tmp/loki/chunks
+      rules_directory: /tmp/loki/rules
+  replication_factor: 1
+  ring:
+    kvstore:
+      store: inmemory
+
+schema_config:
+  configs:
+    - from: 2020-10-24
+      store: boltdb-shipper
+      object_store: filesystem
+      schema: v11
+      index:
+        prefix: index_
+        period: 24h
+
+ruler:
+  alertmanager_url: http://localhost:9093
+
+# Add limits_config to increase ingestion limits for local development
+limits_config:
+  # Maximum rate of ingestion per stream (bytes per second)
+  ingestion_rate_mb: 500 # Increased from default (e.g., 3MB/s)
+  ingestion_burst_size_mb: 1000 # Increased burst allowance
+
+  # Explicitly increase per-stream limits as well
+  per_stream_rate_limit: 100 # MB/s, Increased from default (e.g., 3MB/s)
+  per_stream_rate_limit_burst: 200 # MB/s, Increased burst allowance

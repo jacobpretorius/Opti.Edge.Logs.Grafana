@@ -1,0 +1,51 @@
+version: '3.8'
+
+services:
+  loki:
+    image: grafana/loki:2.9.2
+    container_name: loki
+    ports:
+      - "3100:3100"
+    command: -config.file=/etc/loki/local-config.yaml
+    volumes:
+      - ./loki-config.yml:/etc/loki/local-config.yaml
+    networks:
+      - loki-net
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: grafana
+    ports:
+      - "3000:3000"
+    depends_on:
+      - loki
+    volumes:
+      - grafana-storage:/var/lib/grafana
+      - ./grafana-provisioning/:/etc/grafana/provisioning/
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin # Consider changing this
+    networks:
+      - loki-net
+
+  log-ingestor:
+    build: ./log-ingestor
+    container_name: log-ingestor
+    depends_on:
+      - loki
+    volumes:
+      - ./log-ingestor:/usr/src/app
+      - /usr/src/app/node_modules # Prevent host node_modules from overwriting container
+      - ./logs_temp:/usr/src/app/logs_temp
+    env_file:
+      - ./log-ingestor/.env # Load environment variables from log-ingestor directory
+    networks:
+      - loki-net
+    restart: unless-stopped
+
+volumes:
+  grafana-storage:
+
+networks:
+  loki-net:
+    driver: bridge 

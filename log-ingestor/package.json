@@ -1,0 +1,17 @@
+{
+  "name": "log-ingestor",
+  "version": "1.0.0",
+  "description": "Node.js service to ingest logs from Azure Blob to Loki",
+  "main": "index.js",
+  "type": "module",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "@azure/storage-blob": "^12.17.0",
+    "dotenv": "^16.4.5",
+    "node-fetch": "^3.3.2",
+    "split2": "^4.2.0",
+    "through2": "^4.0.2"
+  }
+}
