@@ -32,6 +32,16 @@ jobs:
           # Generate image names based on the repo name and registry
           # Example: ghcr.io/your-username/Opti-Edge-Logs-Grafana
           images: ghcr.io/${{ github.repository_owner }}/Opti-Edge-Logs-Grafana
+          # Explicitly define tags
+          tags: |
+            # Add 'latest' tag for pushes to the main branch
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+            # Add Git tag if pushing a Git tag (e.g., v1.0.0)
+            type=ref,event=tag
+            # Add branch name tag for pushes to branches (e.g., main, feature/xyz)
+            type=ref,event=branch
+            # Add SHA tag for all pushes
+            type=sha
 
       - name: Build and push Docker image
         uses: docker/build-push-action@v5
