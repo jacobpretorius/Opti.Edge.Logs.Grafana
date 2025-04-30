@@ -15,7 +15,7 @@ Streaming [Cloudflare Edge Logs from Optimizely DXP](https://docs.developers.opt
 
 ## Dashboard
 
-You can import the JSON dashboard from my example with [example-dashboard.json](https://github.com/jacobpretorius/Opti.Edge.Logs.Grafana/blob/main/example-dashboard.json) using the Grafana UI. Give it a couple of minutes on initial startup to get enough data to fill all the panels, or you may need to go into the panel that doesn't show data and click "Run query" for it to populate 🤷‍♂️.
+You can import the JSON dashboard from my example with [example-dashboard.json](https://github.com/jacobpretorius/Opti.Edge.Logs.Grafana/blob/main/example-dashboard.json) using the Grafana UI. Give it a couple of minutes on initial startup to get enough data to fill all the panels.
 
 ![example dashboard](https://github.com/jacobpretorius/Opti.Edge.Logs.Grafana/blob/main/images/example-dashboard.png)
 
