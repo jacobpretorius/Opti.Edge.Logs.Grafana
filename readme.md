@@ -9,7 +9,7 @@ Streaming [Cloudflare Edge Logs from Optimizely DXP](https://docs.developers.opt
 1. Clone this repo
 2. Create an `/.env` file based on the example from [example.env](https://github.com/jacobpretorius/Opti.Edge.Logs.Grafana/blob/main/example.env), replace with your values where needed. Consider changing the default Grafana username and password while you are at it.
 3. Open a terminal in this directory and start the docker stack `docker compose up --build`
-4. Graphana should now be running at [http://localhost:3000](http://localhost:3000)
+4. Grafana should now be running at [http://localhost:3000](http://localhost:3000)
 5. Login as user / pass configured, or default admin/admin
 6. Shutdown with `docker compose down`
 
