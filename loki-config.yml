@@ -34,7 +34,10 @@ ruler:
 limits_config:
   # Stop rejecting samples based on age for local dev
   reject_old_samples: false
-  # reject_old_samples_max_age: 168h # Default is 1 week (168h)
+  # Explicitly set max age to a very large value (1 year) as well
+  reject_old_samples_max_age: 8760h
+  # Allow logs with timestamps slightly in the future (e.g., due to minor clock skew)
+  creation_grace_period: 10m # Allow logs up to 10m in the future
 
   # Set limits to very high values for local development
 

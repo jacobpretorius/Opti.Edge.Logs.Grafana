@@ -91,7 +91,7 @@ async function downloadBlob(blobName, localPath) {
 }
 
 async function sendToLoki(logs) {
-  if (logs.length === 0) return;
+  if (logs.length === 0) return true; // No logs to send is a success
   const body = JSON.stringify({
     streams: [{
       stream: commonLabels,
@@ -109,35 +109,40 @@ async function sendToLoki(logs) {
     });
     if (!response.ok) {
       const errorText = await response.text();
-      console.error(`Error sending ${logs.length} logs to Loki: ${response.status} ${response.statusText}`, errorText);
-      return false; // Indicate failure
+      // Log Loki rejection clearly, but the overall function will still return success
+      console.warn(`Loki rejected batch: ${response.status} ${response.statusText}`, errorText.substring(0, 500) + (errorText.length > 500 ? '...' : ''));
+      return false; // Indicate Loki rejection for this batch
     }
-    return true; // Indicate success
+    return true; // Indicate successful send for this batch
   } catch (error) {
-    console.error(`Error in sendToLoki request for ${logs.length} logs:`, error);
+    console.error(`Network error sending batch to Loki:`, error);
     return false; // Indicate failure
   }
 }
 
 /**
- * Processes a single gzipped log file and returns true on success, false on failure.
+ * Processes a single gzipped log file.
+ * Returns the file's endTime (Date object) if the file was fully read,
+ * even if some batches failed to send to Loki.
+ * Returns null if a critical error prevented reading the file (e.g., download/decompression).
  */
-async function processSingleBlob(blobName) {
+async function processSingleBlob(blobInfo) {
+  const { name: blobName, endTime: blobEndTime } = blobInfo;
   console.log(`Attempting to process blob: ${blobName}`);
   const localPath = path.join(tempLogDir, blobName);
-  let fileProcessedSuccessfully = false;
+  let fileReadCompleted = false;
 
   const downloaded = await downloadBlob(blobName, localPath);
   if (!downloaded) {
     console.error(`Failed to download ${blobName}, cannot process.`);
-    return false; // Cannot proceed if download failed
+    return null; // Critical error
   }
 
   const baseName = path.basename(localPath, '.gz');
   const unzippedFilePath = path.join(tempLogDir, baseName);
   const logsBatch = [];
   let linesProcessed = 0;
-  let allBatchesSentSuccessfully = true;
+  let anyBatchFailed = false; // Track if *any* batch send failed
 
   try {
     // Decompress
@@ -150,12 +155,13 @@ async function processSingleBlob(blobName) {
         .on('error', (err) => {
           console.error(`Error decompressing ${path.basename(localPath)}:`, err);
           fs.unlink(localPath).catch(e => console.warn(`Cleanup failed for ${localPath}:`, e.message));
-          reject(err);
+          reject(err); // Reject promise on decompression error
         });
     });
 
     // Read, Parse, Batch Send
     await new Promise((resolve) => {
+      let streamErrored = false;
       createReadStream(unzippedFilePath)
         .pipe(split2(line => {
           try {
@@ -167,12 +173,13 @@ async function processSingleBlob(blobName) {
           }
         }))
         .pipe(through2.obj(async (logEntry, enc, callback) => {
+          if (streamErrored) return callback(); // Stop processing if stream errored
           if (logEntry?.EdgeStartTimestamp) {
             linesProcessed++;
             logsBatch.push(logEntry);
             if (logsBatch.length >= BATCH_SIZE) {
               const success = await sendToLoki([...logsBatch]);
-              if (!success) allBatchesSentSuccessfully = false;
+              if (!success) anyBatchFailed = true; // Logged in sendToLoki
               logsBatch.length = 0;
             }
           } else if (logEntry) {
@@ -181,33 +188,42 @@ async function processSingleBlob(blobName) {
           callback();
         }))
         .on('finish', async () => {
+          if (streamErrored) {
+            console.warn(`Stream finished after error for ${baseName}. Some data might be missing.`);
+            resolve();
+            return;
+          }
           if (logsBatch.length > 0) {
             const success = await sendToLoki(logsBatch);
-            if (!success) allBatchesSentSuccessfully = false;
+            if (!success) anyBatchFailed = true; // Logged in sendToLoki
           }
-          console.log(`Finished reading ${linesProcessed} lines from ${baseName}. Send success: ${allBatchesSentSuccessfully}`);
-          if (allBatchesSentSuccessfully) {
-            fileProcessedSuccessfully = true;
-          } else {
-            console.error(`Failed to send some batches for ${baseName}. File considered failed.`);
+          console.log(`Finished reading ${linesProcessed} lines from ${baseName}.`);
+          fileReadCompleted = true; // Mark as read fully
+          if (anyBatchFailed) {
+            console.warn(`Some batches failed to send for ${baseName}, but file read completed.`);
           }
           resolve();
         })
         .on('error', (err) => {
-          console.error(`Error reading/processing ${baseName}:`, err);
-          resolve();
+          streamErrored = true;
+          console.error(`Error reading/processing stream for ${baseName}:`, err);
+          resolve(); // Resolve anyway to allow cleanup
         });
     });
 
   } catch (error) {
-    console.error(`Unexpected error during processing of ${path.basename(localPath)}:`, error);
+    // This catches critical errors like decompression failure
+    console.error(`Critical error processing ${path.basename(localPath)}:`, error);
+    fileReadCompleted = false; // Ensure this isn't marked as completed
   } finally {
     // Cleanup
     try { await fs.unlink(localPath); } catch (e) { if (e.code !== 'ENOENT') console.warn(`Could not delete ${path.basename(localPath)} (gz):`, e.message); }
     try { await fs.unlink(unzippedFilePath); } catch (e) { if (e.code !== 'ENOENT') console.warn(`Could not delete ${baseName} (unzipped):`, e.message); }
   }
 
-  return fileProcessedSuccessfully;
+  // Return the blob's end time if we successfully read the whole file,
+  // otherwise return null to indicate a failure before completion.
+  return fileReadCompleted ? blobEndTime : null;
 }
 
 /**
@@ -254,7 +270,6 @@ async function checkAzureAndProcessLogs() {
   }
   checkInProgress = true;
 
-  // Use epoch if no file has been successfully processed yet
   const checkStartTime = lastProcessedFileEndTime || new Date(0);
 
   console.log(`\n[${new Date().toISOString()}] Checking for logs started after ${checkStartTime.toISOString()}...`);
@@ -265,12 +280,8 @@ async function checkAzureAndProcessLogs() {
     for await (const blob of blobs) {
       if (blob.name.endsWith('.log.gz')) {
         const timestamps = parseFilenameTimestamp(blob.name);
-        // Process if the file's START time is strictly after the END time of the last known good file
-        if (timestamps && timestamps.startTime > checkStartTime) {
-          // console.log(` > Found candidate: ${blob.name} (Start: ${timestamps.startTime.toISOString()})`); // Debug
+        if (timestamps && timestamps.startTime >= checkStartTime) {
           blobsToProcess.push({ name: blob.name, startTime: timestamps.startTime, endTime: timestamps.endTime });
-        } else if (timestamps) {
-          // console.log(` > Skipping old/processed: ${blob.name} (Start: ${timestamps.startTime.toISOString()})`); // Debug
         }
       }
     }
@@ -280,14 +291,18 @@ async function checkAzureAndProcessLogs() {
       console.log(`Found ${blobsToProcess.length} new log file(s) to process.`);
 
       for (const blobInfo of blobsToProcess) {
-        const success = await processSingleBlob(blobInfo.name);
-        if (success) {
-          // Update state only on successful processing, using the END time of the processed file
-          lastProcessedFileEndTime = blobInfo.endTime;
-          console.log(`Successfully processed. New checkpoint time: ${lastProcessedFileEndTime.toISOString()} (from ${blobInfo.name})`);
+        // Process the blob. Returns endTime if file read completes, null otherwise.
+        const processedEndTime = await processSingleBlob(blobInfo);
+
+        if (processedEndTime !== null) {
+          // Success: File read completed (even if Loki rejected some batches).
+          // Update checkpoint to the end time of the file we just finished reading.
+          lastProcessedFileEndTime = processedEndTime;
+          console.log(`Read completed for ${blobInfo.name}. New checkpoint time: ${lastProcessedFileEndTime.toISOString()}`);
         } else {
-          console.error(`Failed to process ${blobInfo.name}. Stopping processing this cycle to avoid skipping files.`);
-          break; // Maintain order, retry next cycle
+          // Failure: Critical error occurred (download, decompress, stream read error).
+          console.error(`Critical error processing ${blobInfo.name}. Stopping processing this cycle to maintain order.`);
+          break; // Stop processing this cycle
         }
       }
     } else {
@@ -295,7 +310,7 @@ async function checkAzureAndProcessLogs() {
     }
 
   } catch (error) {
-    console.error('Error during Azure blob check/processing:', error);
+    console.error('Error during Azure blob check/listing:', error);
     if (error.statusCode === 403) {
       console.error('Received a 403 Forbidden error. Check SAS token permissions (list/read).');
     }
@@ -327,10 +342,10 @@ async function initializeAndProcessLatest() {
   if (latestBlobInfo) {
     console.log(`Found latest existing blob: ${latestBlobInfo.name}. Attempting initial processing...`);
     // Process the latest file found on startup
-    const success = await processSingleBlob(latestBlobInfo.name);
-    if (success) {
+    const success = await processSingleBlob(latestBlobInfo);
+    if (success !== null) {
       // Set the checkpoint only if the initial processing succeeded
-      lastProcessedFileEndTime = latestBlobInfo.endTime;
+      lastProcessedFileEndTime = success;
       console.log(`Initial processing successful. Checkpoint set to: ${lastProcessedFileEndTime.toISOString()}`);
     } else {
       console.error(`Initial processing failed for ${latestBlobInfo.name}. Will start polling without an initial checkpoint.`);
