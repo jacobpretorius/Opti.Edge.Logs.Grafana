@@ -1,53 +1,114 @@
 import { ContainerClient } from '@azure/storage-blob';
-import dotenv from 'dotenv';
 import fetch from 'node-fetch';
 import { createGunzip } from 'zlib';
 import { createReadStream, createWriteStream, promises as fs } from 'fs';
 import path from 'path';
-import { fileURLToPath } from 'url';
 import split2 from 'split2';
 import through2 from 'through2';
-
-// Resolve __dirname for ES Modules
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
-
-dotenv.config({ path: path.resolve(__dirname, '.env') }); // Load .env from log-ingestor directory
+import crypto from 'crypto';
 
 // --- Configuration ---
-const sasUrl = process.env.EDGE_LOGS_BLOB_URL;
+const dxpProjectId = process.env.DXP_PROJECT_ID;
+const dxpClientKey = process.env.DXP_CLIENT_KEY;
+const dxpClientSecret = process.env.DXP_CLIENT_SECRET;
+const dxpEnvironment = process.env.DXP_ENVIRONMENT || 'General';
+const dxpStorageContainer = process.env.DXP_STORAGE_CONTAINER || 'cloudflarelogpush';
+
 const lokiUrl = process.env.LOKI_URL || 'http://loki:3100';
-const pollingInterval = 15000; // Poll every 15 seconds
+const pollingInterval = process.env.POLLING_INTERVAL || 15000; // Poll every 15 seconds
 const tempLogDir = process.env.TEMP_LOG_DIR || '/usr/src/app/logs_temp';
 const LOKI_PUSH_API = `${lokiUrl}/loki/api/v1/push`;
 const BATCH_SIZE = 200;
+const SAS_EXPIRY_BUFFER_MS = 60 * 60 * 1000; // Refresh SAS link 1 hour before expiry
 
 // --- State ---
-let containerClient;
-let containerNameForLabels = 'cloudflarelogpush';
+let containerClient = null;
+let containerNameForLabels = dxpStorageContainer || 'cloudflarelogpush';
 let lastProcessedFileEndTime = null; // Track the END time of the last successfully processed file
 let checkInProgress = false;
 let pollTimeoutId = null;
+let currentSasUrl = null;
+let sasUrlExpiresOn = null;
 
 // --- Initial Checks & Setup ---
-if (!sasUrl) {
-  console.error('EDGE_LOGS_BLOB_URL must be provided in .env');
-  process.exit(1);
-}
-try {
-  containerClient = new ContainerClient(sasUrl);
-  const urlPath = new URL(sasUrl).pathname;
-  const pathParts = urlPath.split('/').filter(part => part.length > 0);
-  if (pathParts.length > 0) containerNameForLabels = pathParts[0];
-  console.log(`ContainerClient created for container: ${containerNameForLabels}`);
-} catch (error) {
-  console.error('Failed to create ContainerClient:', error);
+if (!dxpProjectId || !dxpClientKey || !dxpClientSecret || !dxpEnvironment || !dxpStorageContainer) {
+  console.error('DXP_PROJECT_ID, DXP_CLIENT_KEY, DXP_CLIENT_SECRET, DXP_ENVIRONMENT, and DXP_STORAGE_CONTAINER must be provided in .env');
   process.exit(1);
 }
 
 const commonLabels = { job: 'cloudflare-edge-logs', container: containerNameForLabels };
 
 // --- Helper Functions ---
+
+/**
+ * Fetches a SAS Link from the DXP API.
+ * Returns { sasLink: string, expiresOn: Date } or throws an error.
+ */
+async function getDxpSasLink(projectId, clientKey, clientSecret, environment, storageContainer) {
+  const apiUrl = `https://paasportal.episerver.net/api/v1.0/projects/${projectId}/environments/${environment}/storagecontainers/${storageContainer}/saslink`;
+  const method = 'POST';
+  const url = new URL(apiUrl);
+  const pathAndQuery = url.pathname + url.search; // Get path and query
+
+  const body = JSON.stringify({
+    RetentionHours: 24,
+    Writable: false // Read-only access is sufficient
+  });
+
+  const timestamp = Date.now().toString();
+  const nonce = crypto.randomUUID().replace(/-/g, ''); // Generate nonce
+
+  // Calculate body hash (MD5 -> Base64)
+  const bodyBytes = Buffer.from(body, 'utf8');
+  const bodyHashBytes = crypto.createHash('md5').update(bodyBytes).digest();
+  const hashBody = bodyHashBytes.toString('base64');
+
+  // Create signature string
+  const message = `${clientKey}${method}${pathAndQuery}${timestamp}${nonce}${hashBody}`;
+  const messageBytes = Buffer.from(message, 'utf8');
+
+  // Calculate signature (HMACSHA256 -> Base64)
+  // DXP expects the secret to be base64 encoded already, so we decode it first.
+  const hmac = crypto.createHmac('sha256', Buffer.from(clientSecret, 'base64'));
+  const signatureHash = hmac.update(messageBytes).digest();
+  const signature = signatureHash.toString('base64');
+
+  // Construct Authorization header
+  const authHeader = `epi-hmac ${clientKey}:${timestamp}:${nonce}:${signature}`;
+
+  console.log('Requesting new SAS link from DXP API...');
+  try {
+    const response = await fetch(apiUrl, {
+      method: method,
+      headers: {
+        'Authorization': authHeader,
+        'Content-Type': 'application/json',
+        'Accept': 'application/json'
+      },
+      body: body
+    });
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      console.error(`Failed to get DXP SAS Link: ${response.status} ${response.statusText}`, errorText.substring(0, 500));
+      throw new Error(`Failed to get DXP SAS Link: ${response.status}`);
+    }
+
+    const data = await response.json();
+
+    if (data.success && data.result?.sasLink && data.result?.expiresOn) {
+      const expiresOn = new Date(data.result.expiresOn);
+      console.log(`Successfully obtained new SAS link, expires: ${expiresOn.toISOString()}`);
+      return { sasLink: data.result.sasLink, expiresOn: expiresOn };
+    } else {
+      console.error('Failed to parse SAS link or expiry from DXP API response:', JSON.stringify(data).substring(0, 500));
+      throw new Error('Invalid response format from DXP API');
+    }
+  } catch (error) {
+    console.error('Network or other error fetching DXP SAS Link:', error);
+    throw error; // Re-throw to be handled by the caller
+  }
+}
 
 /**
  * Parses Cloudflare log filename like 20250429T153213Z_20250429T153320Z_c80262f4.log.gz
@@ -79,12 +140,19 @@ function parseFilenameTimestamp(filename) {
 }
 
 async function downloadBlob(blobName, localPath) {
+  if (!containerClient) {
+    console.error(`Cannot download blob ${blobName}, containerClient is not initialized.`);
+    return false;
+  }
   const blobClient = containerClient.getBlobClient(blobName);
   try {
     await blobClient.downloadToFile(localPath);
     return true;
   } catch (error) {
     console.error(`Error downloading blob ${blobName}:`, error);
+    if (error.statusCode === 403) {
+      console.warn(`Received 403 downloading ${blobName}. SAS URL might be expired or invalid.`);
+    }
     try { await fs.unlink(localPath); } catch (e) { /* Ignore */ }
     return false;
   }
@@ -135,7 +203,7 @@ async function processSingleBlob(blobInfo) {
   const downloaded = await downloadBlob(blobName, localPath);
   if (!downloaded) {
     console.error(`Failed to download ${blobName}, cannot process.`);
-    return null; // Critical error
+    return null; // Critical error (potentially includes auth error handled above)
   }
 
   const baseName = path.basename(localPath, '.gz');
@@ -231,6 +299,10 @@ async function processSingleBlob(blobInfo) {
  * Returns { name: string, endTime: Date } or null.
  */
 async function findLatestBlobInfo() {
+  if (!containerClient) {
+    console.error('Cannot find latest blob, containerClient is not initialized.');
+    return null;
+  }
   let latestBlobName = null;
   let latestEndTime = new Date(0); // Start with epoch time
 
@@ -248,7 +320,10 @@ async function findLatestBlobInfo() {
     }
   } catch (error) {
     console.error('Error listing blobs during initial scan:', error);
-    return null;
+    if (error.statusCode === 403) {
+      console.warn(`Received 403 listing blobs. SAS URL might be expired or invalid.`);
+    }
+    return null; // Indicate failure to list
   }
 
   if (latestBlobName) {
@@ -260,38 +335,108 @@ async function findLatestBlobInfo() {
   }
 }
 
+/**
+ * Ensures the SAS URL is valid, refreshing if necessary.
+ * Returns true if the SAS URL is valid (or was successfully refreshed), false otherwise.
+ */
+async function ensureValidSasUrl() {
+  const now = Date.now();
+  // Check if SAS URL exists and is nearing expiry
+  if (!currentSasUrl || !sasUrlExpiresOn || sasUrlExpiresOn.getTime() < now + SAS_EXPIRY_BUFFER_MS) {
+    if (sasUrlExpiresOn) {
+      console.log(`SAS URL expiring soon (expires ${sasUrlExpiresOn.toISOString()}) or is missing. Attempting refresh...`);
+    } else {
+      console.log(`SAS URL missing. Attempting initial fetch...`); // Should only happen if initial fetch failed
+    }
+
+    try {
+      const { sasLink, expiresOn } = await getDxpSasLink(
+        dxpProjectId,
+        dxpClientKey,
+        dxpClientSecret,
+        dxpEnvironment,
+        dxpStorageContainer
+      );
+      currentSasUrl = sasLink;
+      sasUrlExpiresOn = expiresOn;
+      // Recreate the client with the new URL
+      containerClient = new ContainerClient(currentSasUrl);
+      // Update containerNameForLabels based on DXP Storage Container name
+      containerNameForLabels = dxpStorageContainer;
+      // Update commonLabels in case the container name changed
+      commonLabels.container = containerNameForLabels;
+      console.log(`ContainerClient updated with new SAS URL for container: ${containerNameForLabels}`);
+      return true; // Refresh successful
+    } catch (error) {
+      console.error('Failed to refresh/obtain SAS URL. Cannot proceed with Azure operations.', error);
+      // Invalidate client if refresh fails
+      containerClient = null;
+      currentSasUrl = null;
+      sasUrlExpiresOn = null;
+      return false; // Refresh failed
+    }
+  }
+  // Existing SAS URL is still valid
+  return true;
+}
+
 // --- Main Polling Loop ---
 
 async function checkAzureAndProcessLogs() {
   if (checkInProgress) {
     console.log('Skipping check, previous run still in progress.');
-    pollTimeoutId = setTimeout(checkAzureAndProcessLogs, pollingInterval);
     return;
   }
   checkInProgress = true;
 
-  const checkStartTime = lastProcessedFileEndTime || new Date(0);
-
-  console.log(`\n[${new Date().toISOString()}] Checking for logs started after ${checkStartTime.toISOString()}...`);
-  let blobsToProcess = [];
-
   try {
-    const blobs = containerClient.listBlobsFlat();
-    for await (const blob of blobs) {
-      if (blob.name.endsWith('.log.gz')) {
-        const timestamps = parseFilenameTimestamp(blob.name);
-        if (timestamps && timestamps.startTime >= checkStartTime) {
-          blobsToProcess.push({ name: blob.name, startTime: timestamps.startTime, endTime: timestamps.endTime });
-        }
-      }
+    // 1. Ensure SAS URL is valid before interacting with Azure
+    const sasOk = await ensureValidSasUrl();
+    if (!sasOk) {
+      console.error("SAS URL is invalid and could not be refreshed. Skipping Azure check this cycle.");
+      return;
     }
 
+    // We should have a valid containerClient now
+    if (!containerClient) {
+      console.error("Container client is unexpectedly null after SAS check. Skipping cycle.");
+      return;
+    }
+
+    const checkStartTime = lastProcessedFileEndTime || new Date(0);
+    console.log(`\n[${new Date().toISOString()}] Checking for logs started after ${checkStartTime.toISOString()}...`);
+    let blobsToProcess = [];
+
+    // 2. List Blobs
+    try {
+      const blobs = containerClient.listBlobsFlat();
+      for await (const blob of blobs) {
+        if (blob.name.endsWith('.log.gz')) {
+          const timestamps = parseFilenameTimestamp(blob.name);
+          // Process blobs whose *start* time is >= our checkpoint (last *end* time)
+          if (timestamps && timestamps.startTime >= checkStartTime) {
+            blobsToProcess.push({ name: blob.name, startTime: timestamps.startTime, endTime: timestamps.endTime });
+          }
+        }
+      }
+    } catch (error) {
+      console.error('Error during Azure blob check/listing:', error);
+      if (error.statusCode === 403) {
+        console.error('Received a 403 Forbidden error listing blobs. SAS URL might be invalid. Will attempt refresh on next cycle.');
+        // Invalidate the current URL to force refresh next time
+        sasUrlExpiresOn = new Date(0); // Force expiry
+      }
+      // Don't process blobs if listing failed
+      blobsToProcess = [];
+    }
+
+    // 3. Process Found Blobs
     if (blobsToProcess.length > 0) {
       blobsToProcess.sort((a, b) => a.startTime - b.startTime);
       console.log(`Found ${blobsToProcess.length} new log file(s) to process.`);
 
       for (const blobInfo of blobsToProcess) {
-        // Process the blob. Returns endTime if file read completes, null otherwise.
+        // processSingleBlob implicitly uses the potentially updated containerClient
         const processedEndTime = await processSingleBlob(blobInfo);
 
         if (processedEndTime !== null) {
@@ -302,21 +447,20 @@ async function checkAzureAndProcessLogs() {
         } else {
           // Failure: Critical error occurred (download, decompress, stream read error).
           console.error(`Critical error processing ${blobInfo.name}. Stopping processing this cycle to maintain order.`);
-          break; // Stop processing this cycle
+          // If the download failed with 403, ensureValidSasUrl should handle refresh next cycle.
+          break; // Stop processing further blobs this cycle
         }
       }
     } else {
-      console.log('No new log files found.');
+      console.log('No new log files found or listing failed.');
     }
 
   } catch (error) {
-    console.error('Error during Azure blob check/listing:', error);
-    if (error.statusCode === 403) {
-      console.error('Received a 403 Forbidden error. Check SAS token permissions (list/read).');
-    }
+    // Catch unexpected errors in the main loop logic itself
+    console.error('Unexpected error in main processing loop:', error);
   } finally {
     checkInProgress = false;
-    // console.log(`Scheduling next check. Current checkpoint: ${lastProcessedFileEndTime?.toISOString() || 'None'}`); // Debug
+    if (pollTimeoutId) clearTimeout(pollTimeoutId);
     pollTimeoutId = setTimeout(checkAzureAndProcessLogs, pollingInterval);
   }
 }
@@ -333,36 +477,46 @@ async function initializeAndProcessLatest() {
   }
 
   console.log(`Starting Log Ingestor Service...`);
-  console.log(`Connecting to Azure Container: ${containerNameForLabels}`);
+  console.log(`Using DXP Project: ${dxpProjectId}, Env: ${dxpEnvironment}, Container: ${dxpStorageContainer}`);
   console.log(`Sending logs to Loki: ${LOKI_PUSH_API}`);
   console.log(`Polling Interval: ${pollingInterval / 1000} seconds`);
 
-  const latestBlobInfo = await findLatestBlobInfo();
+  // 1. Initial SAS URL Fetch
+  const initialSasOk = await ensureValidSasUrl(); // This will fetch and set currentSasUrl, sasUrlExpiresOn, containerClient
+  if (!initialSasOk) {
+    console.error("Failed to obtain initial SAS URL from DXP API. Cannot start processing. Exiting.");
+    process.exit(1);
+  }
+
+  // 2. Process Latest Existing Blob (Optional, using the fetched SAS URL)
+  const latestBlobInfo = await findLatestBlobInfo(); // Uses the containerClient created by ensureValidSasUrl
 
   if (latestBlobInfo) {
     console.log(`Found latest existing blob: ${latestBlobInfo.name}. Attempting initial processing...`);
     // Process the latest file found on startup
-    const success = await processSingleBlob(latestBlobInfo);
-    if (success !== null) {
+    const processedEndTime = await processSingleBlob(latestBlobInfo); // Uses the same containerClient
+    if (processedEndTime !== null) {
       // Set the checkpoint only if the initial processing succeeded
-      lastProcessedFileEndTime = success;
+      lastProcessedFileEndTime = processedEndTime;
       console.log(`Initial processing successful. Checkpoint set to: ${lastProcessedFileEndTime.toISOString()}`);
     } else {
       console.error(`Initial processing failed for ${latestBlobInfo.name}. Will start polling without an initial checkpoint.`);
       // lastProcessedFileEndTime remains null, the first poll will check from epoch
     }
   } else {
-    console.log('No existing log files found. Will process files as they appear.');
+    console.log('No existing log files found or listing failed. Will process files as they appear.');
     // lastProcessedFileEndTime remains null
   }
 
-  // Start the regular polling loop regardless of initial processing outcome
+  // 3. Start the regular polling loop regardless of initial processing outcome
   console.log('Starting regular polling...');
-  checkAzureAndProcessLogs();
+  // Clear any potentially existing timer before starting the main loop
+  if (pollTimeoutId) clearTimeout(pollTimeoutId);
+  checkAzureAndProcessLogs(); // This will immediately check expiry and list blobs
 }
 
 // --- Start the service ---
-initializeAndProcessLatest(); // Use the updated startup function name
+initializeAndProcessLatest();
 
 // --- Signal Handling ---
 function shutdown() {

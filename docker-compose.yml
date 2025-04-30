@@ -7,6 +7,7 @@ services:
     command: -config.file=/etc/loki/local-config.yaml
     volumes:
       - ./loki-config.yml:/etc/loki/local-config.yaml
+      - loki-data:/loki
     networks:
       - loki-net
     healthcheck:
@@ -15,6 +16,7 @@ services:
       timeout: 5s
       retries: 5
       start_period: 15s
+    restart: unless-stopped
 
   grafana:
     image: grafana/grafana:latest
@@ -27,8 +29,8 @@ services:
       - grafana-storage:/var/lib/grafana
       - ./grafana-provisioning/:/etc/grafana/provisioning/
     environment:
-      - GF_SECURITY_ADMIN_USER=admin
-      - GF_SECURITY_ADMIN_PASSWORD=admin # Consider changing this
+      - GF_SECURITY_ADMIN_USER=${GF_SECURITY_ADMIN_USER:-admin} # Use default 'admin' if not in .env
+      - GF_SECURITY_ADMIN_PASSWORD=${GF_SECURITY_ADMIN_PASSWORD:-admin} # Use default 'admin' if not in .env
     networks:
       - loki-net
 
@@ -38,18 +40,18 @@ services:
     depends_on:
       loki:
         condition: service_healthy
-    volumes:
-      - ./log-ingestor:/usr/src/app
-      - /usr/src/app/node_modules
-      - ./logs_temp:/usr/src/app/logs_temp
-    env_file:
-      - ./log-ingestor/.env
+    environment:
+      - DXP_PROJECT_ID=${DXP_PROJECT_ID}
+      - DXP_CLIENT_KEY=${DXP_CLIENT_KEY}
+      - DXP_CLIENT_SECRET=${DXP_CLIENT_SECRET}
+      - POLLING_INTERVAL=${POLLING_INTERVAL:-15000} # Default to 15 seconds if not in .env
     networks:
       - loki-net
     restart: unless-stopped
 
 volumes:
   grafana-storage:
+  loki-data: {}
 
 networks:
   loki-net:
