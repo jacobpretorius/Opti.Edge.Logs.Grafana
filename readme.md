@@ -1,21 +1,16 @@
-# Grafana + Loki + Optimizely Edge Logs
+# Optimizely Edge Logs + Grafana + Loki
 
 Streaming Cloudflare Edge Logs from Optimizely DXP to a self hosted Grafana + Loki instance.
 
-## Setup
+## Setup & Running
 
-Create an `/.env` file based on the example from `/example.env` and replace with your values where needed. 
+1. Clone this repo
+2. Create an `/.env` file based on the example from `/example.env`, replace with your values where needed. Consider changing the default Grapaha username and password while you are at it.
+3. Open a terminal in this directory and start the docker stack `docker compose up --build`
+4. Graphana should now be running at [http://localhost:3000](http://localhost:3000)
+5. Login as user / pass configured, or default admin/admin
+6. Shutdown with `docker compose down`
 
-Also, consider changing the default Grapaha username and password while you are at it.
+## Dashboard
 
-## Running Locally
-
-docker compose up --build
-
-http://localhost:3000
-
-Login as user / pass configured, or default admin/admin
-
-## Dashboard Me
-
-You can import the JSON dashboard from my example with `/example-dashboard.json` using the Gradana UI. Give it a couple of minutes on initial startup to get enough data to fill all the panels.
+You can import the JSON dashboard from my example with `/example-dashboard.json` using the Gradana UI. Give it a couple of minutes on initial startup to get enough data to fill all the panels, or you may need to go into the panel that doesn't show data and click "Run query" for it to populate 🤷‍♂️.
