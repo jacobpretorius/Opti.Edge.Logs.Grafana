@@ -77,6 +77,14 @@ async function getDxpSasLink(projectId, clientKey, clientSecret, environment, st
   const authHeader = `epi-hmac ${clientKey}:${timestamp}:${nonce}:${signature}`;
 
   console.log('Requesting new SAS link from DXP API...');
+
+  const controller = new AbortController();
+  const timeoutMs = 30000; // 30 seconds timeout
+  const timeoutId = setTimeout(() => {
+    console.error(`DXP API request timed out after ${timeoutMs / 1000}s`);
+    controller.abort();
+  }, timeoutMs);
+
   try {
     const response = await fetch(apiUrl, {
       method: method,
@@ -85,7 +93,8 @@ async function getDxpSasLink(projectId, clientKey, clientSecret, environment, st
         'Content-Type': 'application/json',
         'Accept': 'application/json'
       },
-      body: body
+      body: body,
+      signal: controller.signal // Added abort signal
     });
 
     if (!response.ok) {
@@ -107,6 +116,8 @@ async function getDxpSasLink(projectId, clientKey, clientSecret, environment, st
   } catch (error) {
     console.error('Network or other error fetching DXP SAS Link:', error);
     throw error; // Re-throw to be handled by the caller
+  } finally {
+    clearTimeout(timeoutId);
   }
 }
 
@@ -423,9 +434,11 @@ async function checkAzureAndProcessLogs() {
       console.error('Error during Azure blob check/listing:', error);
       if (error.statusCode === 403) {
         console.error('Received a 403 Forbidden error listing blobs. SAS URL might be invalid. Will attempt refresh on next cycle.');
-        // Invalidate the current URL to force refresh next time
-        sasUrlExpiresOn = new Date(0); // Force expiry
       }
+      // Always assume the SAS might be an issue if listing blobs fails for any reason.
+      // This will force ensureValidSasUrl to attempt a refresh on the next cycle.
+      console.warn('Forcing SAS refresh attempt on next cycle due to blob listing error.');
+      sasUrlExpiresOn = new Date(0); // Force expiry check
       // Don't process blobs if listing failed
       blobsToProcess = [];
     }
