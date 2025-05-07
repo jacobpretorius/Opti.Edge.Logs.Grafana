@@ -27,6 +27,12 @@ schema_config:
         prefix: index_
         period: 24h
 
+compactor:
+  working_directory: /tmp/loki/compactor # Or your preferred path for compactor data
+  compaction_interval: 10m
+  retention_enabled: true
+  delete_request_store: filesystem
+
 ruler:
   alertmanager_url: http://localhost:9093
 
@@ -38,6 +44,10 @@ limits_config:
   reject_old_samples_max_age: 8760h
   # Allow logs with timestamps slightly in the future (e.g., due to minor clock skew)
   creation_grace_period: 10m # Allow logs up to 10m in the future
+
+  # Configure retention period and max query lookback
+  retention_period: 168h # 7 days
+  max_query_lookback: 168h # 7 days
 
   # Set limits to very high values for local development
 
