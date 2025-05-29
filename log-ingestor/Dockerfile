@@ -2,6 +2,10 @@ FROM node:22-alpine
 
 WORKDIR /usr/src/app
 
+# Install tzdata and set timezone to UTC
+RUN apk add --no-cache tzdata
+ENV TZ=UTC
+
 COPY package*.json ./
 
 RUN npm install

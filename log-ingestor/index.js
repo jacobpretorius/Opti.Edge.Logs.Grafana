@@ -391,6 +391,38 @@ async function ensureValidSasUrl() {
   return true;
 }
 
+/**
+ * Lists blobs from the container client with a specified timeout.
+ * Returns an array of blob items or throws an error if timeout or listing fails.
+ */
+async function listBlobsWithTimeout(client, timeoutMs) {
+  let timeoutHandle;
+  const timeoutPromise = new Promise((_, reject) => {
+    timeoutHandle = setTimeout(() => {
+      reject(new Error(`Blob listing timed out after ${timeoutMs / 1000}s`));
+    }, timeoutMs);
+  });
+
+  try {
+    const blobs = [];
+    const iterator = client.listBlobsFlat(); // Get the async iterator
+    // Race the actual listing against the timeout
+    const resultPromise = (async () => {
+      for await (const blob of iterator) {
+        blobs.push(blob);
+      }
+      return blobs;
+    })();
+
+    const result = await Promise.race([resultPromise, timeoutPromise]);
+    clearTimeout(timeoutHandle); // Clear timeout if listing finishes or errors first
+    return result; // This will be the array of blobs if successful
+  } catch (error) {
+    clearTimeout(timeoutHandle); // Ensure timeout is cleared on any error
+    throw error; // Re-throw the error (either from listing or the timeout itself)
+  }
+}
+
 // --- Main Polling Loop ---
 
 async function checkAzureAndProcessLogs() {
@@ -405,23 +437,33 @@ async function checkAzureAndProcessLogs() {
     const sasOk = await ensureValidSasUrl();
     if (!sasOk) {
       console.error("SAS URL is invalid and could not be refreshed. Skipping Azure check this cycle.");
+      // No finally block here, so ensure checkInProgress is reset and next poll is scheduled
+      checkInProgress = false;
+      if (pollTimeoutId) clearTimeout(pollTimeoutId);
+      pollTimeoutId = setTimeout(checkAzureAndProcessLogs, pollingInterval);
       return;
     }
 
     // We should have a valid containerClient now
     if (!containerClient) {
       console.error("Container client is unexpectedly null after SAS check. Skipping cycle.");
+      checkInProgress = false;
+      if (pollTimeoutId) clearTimeout(pollTimeoutId);
+      pollTimeoutId = setTimeout(checkAzureAndProcessLogs, pollingInterval);
       return;
     }
 
     const checkStartTime = lastProcessedFileEndTime || new Date(0);
     console.log(`\n[${new Date().toISOString()}] Checking for logs started after ${checkStartTime.toISOString()}...`);
     let blobsToProcess = [];
+    const BLOB_LISTING_TIMEOUT_MS = 60000; // 60 seconds timeout for listing blobs
 
     // 2. List Blobs
     try {
-      const blobs = containerClient.listBlobsFlat();
-      for await (const blob of blobs) {
+      // Use the new function with a timeout
+      const listedBlobs = await listBlobsWithTimeout(containerClient, BLOB_LISTING_TIMEOUT_MS);
+
+      for (const blob of listedBlobs) {
         if (blob.name.endsWith('.log.gz')) {
           const timestamps = parseFilenameTimestamp(blob.name);
           // Process blobs whose *start* time is >= our checkpoint (last *end* time)
@@ -431,16 +473,19 @@ async function checkAzureAndProcessLogs() {
         }
       }
     } catch (error) {
-      console.error('Error during Azure blob check/listing:', error);
-      if (error.statusCode === 403) {
-        console.error('Received a 403 Forbidden error listing blobs. SAS URL might be invalid. Will attempt refresh on next cycle.');
+      console.error('Error during Azure blob check/listing:', error.message); // Log error.message for more clarity
+      if (error.message && error.message.includes('timed out')) {
+        console.warn(`Blob listing timed out after ${BLOB_LISTING_TIMEOUT_MS / 1000}s. Will attempt SAS refresh on next cycle.`);
+      } else if (error.statusCode === 403) {
+        console.warn('Received a 403 Forbidden error listing blobs. SAS URL might be invalid. Will attempt refresh on next cycle.');
+      } else {
+        // Generic message for other types of errors during listing
+        console.warn('An unexpected error occurred during blob listing. Will attempt SAS refresh on next cycle.');
       }
-      // Always assume the SAS might be an issue if listing blobs fails for any reason.
-      // This will force ensureValidSasUrl to attempt a refresh on the next cycle.
-      console.warn('Forcing SAS refresh attempt on next cycle due to blob listing error.');
-      sasUrlExpiresOn = new Date(0); // Force expiry check
+      // Forcing SAS refresh for timeout or other listing errors is a good precaution.
+      sasUrlExpiresOn = new Date(0); // Force expiry check on next run
       // Don't process blobs if listing failed
-      blobsToProcess = [];
+      blobsToProcess = []; // Ensure blobsToProcess is empty to prevent processing
     }
 
     // 3. Process Found Blobs
