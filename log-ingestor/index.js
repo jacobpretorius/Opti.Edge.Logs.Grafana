@@ -108,6 +108,7 @@ async function getDxpSasLink(projectId, clientKey, clientSecret, environment, st
     if (data.success && data.result?.sasLink && data.result?.expiresOn) {
       const expiresOn = new Date(data.result.expiresOn);
       console.log(`Successfully obtained new SAS link, expires: ${expiresOn.toISOString()}`);
+      console.log(`SAS Link: ${data.result.sasLink}`);
       return { sasLink: data.result.sasLink, expiresOn: expiresOn };
     } else {
       console.error('Failed to parse SAS link or expiry from DXP API response:', JSON.stringify(data).substring(0, 500));
@@ -473,19 +474,19 @@ async function checkAzureAndProcessLogs() {
         }
       }
     } catch (error) {
-      console.error('Error during Azure blob check/listing:', error.message); // Log error.message for more clarity
-      if (error.message && error.message.includes('timed out')) {
-        console.warn(`Blob listing timed out after ${BLOB_LISTING_TIMEOUT_MS / 1000}s. Will attempt SAS refresh on next cycle.`);
-      } else if (error.statusCode === 403) {
-        console.warn('Received a 403 Forbidden error listing blobs. SAS URL might be invalid. Will attempt refresh on next cycle.');
+      console.error('Error during Azure blob check/listing:', error.message ? error.message : error); // Log full error if message is not present
+      blobsToProcess = []; // Do not process any blobs if listing failed
+
+      if (error.statusCode === 403) {
+        console.warn('Received a 403 Forbidden error listing blobs. SAS URL might be invalid. Forcing refresh attempt on next cycle.');
+        sasUrlExpiresOn = new Date(0); // Force SAS refresh for 403
+      } else if (error.message && error.message.includes('timed out')) {
+        console.warn(`Blob listing timed out after ${BLOB_LISTING_TIMEOUT_MS / 1000}s. Will check SAS validity on next cycle normally.`);
+        // DO NOT force immediate SAS refresh for timeout. ensureValidSasUrl will handle it if it's actually expired.
       } else {
-        // Generic message for other types of errors during listing
-        console.warn('An unexpected error occurred during blob listing. Will attempt SAS refresh on next cycle.');
+        // For other errors like "aborted" or unexpected issues
+        console.warn('An unexpected error occurred during blob listing. The existing SAS URL will be re-evaluated for validity on the next cycle. Full error details:', error);
       }
-      // Forcing SAS refresh for timeout or other listing errors is a good precaution.
-      sasUrlExpiresOn = new Date(0); // Force expiry check on next run
-      // Don't process blobs if listing failed
-      blobsToProcess = []; // Ensure blobsToProcess is empty to prevent processing
     }
 
     // 3. Process Found Blobs
